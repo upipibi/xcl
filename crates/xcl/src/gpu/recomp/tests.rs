@@ -2394,6 +2394,74 @@ fn gpu_images_sample_load_store_atomic() {
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
 }
 
+/// An image atomic with DMASK 0x3 (0xF for cmpswap) works on 64 bits: VDATA[0:1] against the
+/// texel's two dwords (LLVM's SIISelLowering: `DMask = Is64Bit ? 0x3 : 0x1`, cmpswap
+/// `0xf : 0x3`), and with GLC the old value comes back in VDATA[0:1] (#1485, whose test this
+/// extends: add and umax were measured there, 32-bit on `b7aa9f3`). On a PC, a uint64_t /
+/// int64_t view of the console's 32_32_UINT texel (R32G32_UINT, SM 6.6 int64 atomics).
+#[test]
+fn gpu_image_atomics_64_bit() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TexDim, TestTexture};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // 1x1 32_32_UINT UAVs, T# in s[16:23], s[32:39], s[40:47], s[48:55]; every lane hits texel (0, 0)
+    let at = |srsrc: u64, vdata: u64, dmask: u64, glc: u64| [("VDATA", vdata), ("VADDR", 0), ("SRSRC", srsrc), ("DMASK", dmask), ("DIM", 1), ("UNORM", 1), ("GLC", glc)];
+    code.extend(mimg("IMAGE_ATOMIC_ADD", &at(4, 10, 0x3, 1)));
+    code.extend(mimg("IMAGE_ATOMIC_UMAX", &at(8, 12, 0x3, 0)));
+    code.extend(mimg("IMAGE_ATOMIC_SMIN", &at(10, 14, 0x3, 0)));
+    code.extend(mimg("IMAGE_ATOMIC_CMPSWAP", &at(12, 16, 0xF, 1)));
+    // a 32-bit cmpswap (DMASK 0x3) next to them stays 32-bit: tex4, low dword only
+    code.extend(mimg("IMAGE_ATOMIC_CMPSWAP", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 14), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let mut st = KernelState::default();
+    for (k, s) in [16usize, 32, 40, 48, 56].into_iter().enumerate() {
+        st.sgpr[s..s + 8].copy_from_slice(&tsharp(2 * k as u32, 62, 9));
+    }
+    let lanes = st.vgpr.len() as u64;
+    let neg = |l: u64| (-((l as i64) << 32) - 5) as u64;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u64;
+        r[0] = 0;
+        r[1] = 0;
+        // add 2^32 - 1 per lane: the sum carries into the high dword
+        (r[10], r[11]) = (0xFFFF_FFFF, 0);
+        // (l << 32) | (1000 - l): the largest u64 is lane 63's, not the largest low dword
+        (r[12], r[13]) = (1000 - l as u32, l as u32);
+        // -(l << 32) - 5: the smallest i64 is the last lane's (unsigned or low-dword order differs)
+        (r[14], r[15]) = (neg(l) as u32, (neg(l) >> 32) as u32);
+        // new (l + 2) << 32 | 7 where the texel is 1 << 32: one lane wins
+        (r[16], r[17], r[18], r[19]) = (7, l as u32 + 2, 0, 1);
+        // 32-bit: new 9 where the low dword is 0
+        (r[20], r[21]) = (9, 0);
+    }
+    let texel = |v: u64| TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: v.to_le_bytes().to_vec(), uav: true };
+    let tex = vec![texel(0), texel(0), texel(0), texel(1 << 32), texel(0x5555_5555_0000_0000)];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let got = |i: usize| u64::from_le_bytes(r.textures[i][..8].try_into().unwrap());
+    let pair = |l: usize, v: usize| r.vgpr[l][v] as u64 | (r.vgpr[l][v + 1] as u64) << 32;
+    assert_eq!(got(0), lanes * 0xFFFF_FFFF, "image_atomic_add 64-bit (a 32-bit add loses the carry)");
+    // GLC: each lane got the texel before its add, 0 .. (lanes - 1) adds of 2^32 - 1
+    let mut olds: Vec<u64> = (0..lanes as usize).map(|l| pair(l, 10)).collect();
+    olds.sort();
+    assert_eq!(olds, (0..lanes).map(|k| k * 0xFFFF_FFFF).collect::<Vec<_>>(), "image_atomic_add 64-bit GLC");
+    assert_eq!(got(1), (lanes - 1) << 32 | (1000 - (lanes - 1)), "image_atomic_umax 64-bit (a 32-bit max orders by the low dword)");
+    assert_eq!(got(2), neg(lanes - 1), "image_atomic_smin 64-bit");
+    // cmpswap: one lane saw 1 << 32 and wrote its value; every other lane saw that value
+    let fin = got(3);
+    let winners: Vec<usize> = (0..lanes as usize).filter(|&l| pair(l, 16) == 1 << 32).collect();
+    assert_eq!(winners.len(), 1, "image_atomic_cmpswap 64-bit: one lane swaps (final {fin:#x})");
+    assert_eq!(fin, (winners[0] as u64 + 2) << 32 | 7, "image_atomic_cmpswap 64-bit: the winner's value");
+    assert!((0..lanes as usize).filter(|&l| l != winners[0]).all(|l| pair(l, 16) == fin), "image_atomic_cmpswap 64-bit GLC");
+    assert_eq!(got(4), 0x5555_5555_0000_0009, "image_atomic_cmpswap 32-bit leaves the high dword");
+}
+
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
 /// the console compiler places a root signature's static samplers – and samples the same
 /// texel boundary with each; they become static samplers of the root signature.

@@ -2482,6 +2482,49 @@ impl Em {
                     uav("float")
                 ));
             }
+            // DMASK 0x3 (0xF for cmpswap): a 64-bit atomic, VDATA[0:1] against the texel's two
+            // dwords (LLVM's SIISelLowering: `DMask = Is64Bit ? 0x3 : 0x1`, cmpswap `0xf : 0x3`).
+            // On the PC a uint64_t / int64_t view (SM 6.6 int64 atomics on typed and descriptor
+            // heap resources; a device without them refuses the pipeline, it does not run the
+            // atomic on the low dword).
+            _ if base.starts_with("atomic_") && dmask == if base.ends_with("cmpswap") { 0xF } else { 0x3 } => {
+                let op = &base[7..];
+                let pair = |s: &mut Self, r: u64| (s.vreg(r), s.vreg(r + 1));
+                let (lo, hi) = pair(self, vdata);
+                let v64 = format!("(((uint64_t){hi} << 32) | (uint64_t){lo})");
+                let signed = matches!(op, "smin" | "smax");
+                let vt = if signed { "int64_t" } else { "uint64_t" };
+                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                self.line(&format!("{vt} {t}_old = 0;"));
+                let at = format!("{t}_U[{icoord}]");
+                let body = match op {
+                    "cmpswap" => {
+                        // VDATA[0:1] the new value, VDATA[2:3] the one compared with
+                        let (cl, ch) = pair(self, vdata + 2);
+                        format!("InterlockedCompareExchange({at}, (((uint64_t){ch} << 32) | (uint64_t){cl}), {v64}, {t}_old);")
+                    }
+                    "sub" => format!("InterlockedAdd({at}, 0ull - {v64}, {t}_old);"),
+                    _ => {
+                        let func = match op {
+                            "add" => "InterlockedAdd",
+                            "smin" | "umin" => "InterlockedMin",
+                            "smax" | "umax" => "InterlockedMax",
+                            "and" => "InterlockedAnd",
+                            "or" => "InterlockedOr",
+                            "xor" => "InterlockedXor",
+                            "swap" => "InterlockedExchange",
+                            // inc / dec wrap at a 64-bit limit; no float 64-bit image atomics
+                            _ => return Err("image_atomic 64-bit"),
+                        };
+                        let val = if signed { format!("(int64_t){v64}") } else { v64.clone() };
+                        format!("{func}({at}, {val}, {t}_old);")
+                    }
+                };
+                self.line(&format!("if ({act}) {{ {body} }}"));
+                if f("GLC") == 1 {
+                    self.line(&format!("if ({act}) {{ {lo} = (uint){t}_old; {hi} = (uint)((uint64_t){t}_old >> 32); }}"));
+                }
+            }
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
