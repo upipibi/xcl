@@ -10,7 +10,8 @@
 use super::lower::{self, Bin, Cmp, Ir};
 use super::ssa::{Sink, Var};
 use crate::gpu::dxil::container::Stage;
-use crate::gpu::dxil::module::{BinOp, Block, CastOp, Pred, Value};
+use crate::gpu::dxil::module::{BinOp, Block, CastOp, Pred, RmwOp, Value};
+use crate::gpu::dxil::ops::{barrier, GroupShared};
 use crate::gpu::dxil::shader::{RawUav, Shader};
 use crate::gpu::rdna2::Decoded;
 
@@ -20,16 +21,33 @@ struct DxilIr {
     res: Option<RawUav>,
     mem: RawUav,
     blocks: Vec<Block>,
+    /// a wave64 program in two hardware wave32 halves (`docs/wave64-on-wave32.md`)
+    split: Option<Split>,
+    split_threads: Option<u32>,
+}
+
+/// The split form's state, set up in the entry block: the console thread each hardware thread
+/// stands for (`xcl_x_thread`'s arrival order) and the halves' exchange words.
+#[derive(Clone, Copy)]
+struct Split {
+    xs: GroupShared,
+    /// console thread in the group, lane (0..63), half (0 / 1), console wave in the group
+    tid: Value,
+    lane: Value,
+    half: Value,
+    cw: Value,
+    /// exchanges so far (an alloca: no SSA of its own runs here)
+    xk: Value,
 }
 
 impl DxilIr {
-    fn new(kernel: bool) -> DxilIr {
+    fn new(kernel: bool, split_threads: Option<u32>) -> DxilIr {
         let mut s = Shader::new(Stage::Compute, (6, 6));
         let io = s.raw_uav(0, 0);
         let res = kernel.then(|| s.raw_uav(1, 0));
         // compute: other waves may write the memory this one reads (as the HLSL path declares it)
         let mem = if kernel { s.raw_uav(2, 0) } else { s.raw_uav_coherent(2, 0) };
-        DxilIr { s, io, res, mem, blocks: Vec::new() }
+        DxilIr { s, io, res, mem, blocks: Vec::new(), split: None, split_threads }
     }
 
     fn ty(&mut self, var: Var) -> crate::gpu::dxil::module::Ty {
@@ -42,6 +60,84 @@ impl DxilIr {
     fn bytes(&mut self, dword: Value) -> Value {
         let four = self.s.m.i32c(4);
         self.s.m.bin(BinOp::Mul, dword, four)
+    }
+
+    fn c(&mut self, v: u32) -> Value {
+        self.s.m.i32c(v)
+    }
+
+    fn bin2(&mut self, op: BinOp, a: Value, b: u32) -> Value {
+        let k = self.c(b);
+        self.s.m.bin(op, a, k)
+    }
+
+    /// The split form's entry: the lane counter zeroed, then each hardware wave takes the next
+    /// 32 console threads (`setup_lanes_compute`'s split branch).
+    fn setup_split(&mut self, total: u32) {
+        let waves = total.div_ceil(64).max(1);
+        let i32 = self.s.m.i32();
+        let xs = self.s.groupshared("xcl_xs", i32, 4 * waves as u64);
+        let xw = self.s.groupshared("xcl_xw", i32, 1);
+        let xk = self.s.m.alloca(i32, 4);
+        let z = self.c(0);
+        self.s.m.store(xk, z, 4);
+        let p = self.s.gs_ptr(xw, z);
+        self.s.m.store(p, z, 4);
+        self.s.barrier(barrier::GROUP_SYNC);
+        let t = self.s.m.i1c(true);
+        let n = self.s.wave_all_bit_count(t);
+        let k32 = self.c(32);
+        let full = self.s.m.cmp(Pred::Eq, n, k32);
+        let first = self.s.wave_is_first_lane();
+        let take = self.s.m.bin(BinOp::And, first, full);
+        let k = self.s.m.select(take, k32, z);
+        let got = self.s.m.atomic_rmw(RmwOp::Add, p, k);
+        let dflt = self.c(total & !31);
+        let base = self.s.m.select(take, got, dflt);
+        let base = self.s.wave_read_lane_first(base);
+        let t = self.s.m.i1c(true);
+        let rank = self.s.wave_prefix_bit_count(t);
+        let tid = self.s.m.bin(BinOp::Add, base, rank);
+        let lane = self.bin2(BinOp::And, tid, 63);
+        let half = self.bin2(BinOp::LShr, lane, 5);
+        let cw = self.bin2(BinOp::LShr, tid, 6);
+        self.split = Some(Split { xs, tid, lane, half, cw, xk });
+    }
+
+    /// The slot of `half` for the exchange of parity `par` in this console wave's words.
+    fn slot(&mut self, sp: Split, half: Value, par: Value) -> Value {
+        let x = self.bin2(BinOp::Shl, sp.cw, 1);
+        let x = self.s.m.bin(BinOp::Add, x, half);
+        let x = self.bin2(BinOp::Shl, x, 1);
+        self.s.m.bin(BinOp::Add, x, par)
+    }
+
+    /// The split form's exchange: this half gives `v` (the same in all its lanes), gets the
+    /// other half's. The halves are the whole group (one console wave of 33–64 threads, as
+    /// `gpu::dxil::lanes`'s `Partner::Present`): they meet at a group barrier, which needs no
+    /// block of its own, so the lowering's block order (its dominance order) stays as it is.
+    /// The lowering refuses a whole-wave operation where some lanes may be elsewhere, so both
+    /// halves reach the same exchanges in the same order and every barrier is reached by the
+    /// whole group. A slot per (half, parity of the exchange count): the partner can be at most
+    /// one exchange ahead, so it never overwrites the word being read.
+    fn exchange(&mut self, v: Value) -> Value {
+        let sp = self.split.expect("split form");
+        if self.split_threads.is_some_and(|t| t <= 32) {
+            // a console wave of at most 32 threads: no partner half, its lanes read as 0
+            return self.c(0);
+        }
+        let k = self.s.m.load(sp.xk, 4);
+        let k1 = self.bin2(BinOp::Add, k, 1);
+        self.s.m.store(sp.xk, k1, 4);
+        let par = self.bin2(BinOp::And, k, 1);
+        let mine = self.slot(sp, sp.half, par);
+        let p = self.s.gs_ptr(sp.xs, mine);
+        self.s.m.store(p, v, 4);
+        self.s.barrier(barrier::GROUP_SYNC);
+        let ho = self.bin2(BinOp::Xor, sp.half, 1);
+        let theirs = self.slot(sp, ho, par);
+        let q = self.s.gs_ptr(sp.xs, theirs);
+        self.s.m.load(q, 4)
     }
 }
 
@@ -66,8 +162,15 @@ impl Sink for DxilIr {
 
 impl Ir for DxilIr {
     fn new_block(&mut self) -> usize {
-        let b = if self.blocks.is_empty() { self.s.m.entry_block() } else { self.s.m.new_block() };
+        let first = self.blocks.is_empty();
+        let b = if first { self.s.m.entry_block() } else { self.s.m.new_block() };
         self.blocks.push(b);
+        if first {
+            if let Some(t) = self.split_threads {
+                self.s.m.set_block(b);
+                self.setup_split(t);
+            }
+        }
         self.blocks.len() - 1
     }
     fn at(&mut self, block: usize) {
@@ -116,33 +219,63 @@ impl Ir for DxilIr {
         self.s.m.cast(CastOp::ZExt, b, t)
     }
     fn lane(&mut self) -> Value {
-        self.s.wave_lane_index()
+        match self.split {
+            Some(sp) => sp.lane,
+            None => self.s.wave_lane_index(),
+        }
+    }
+    fn whole_needs_exchange(&self) -> bool {
+        self.split.is_some()
     }
     fn group_id(&mut self, k: u32) -> Value {
         self.s.group_id(k)
     }
     fn compute_ids(&mut self, threads: [u32; 3]) -> (Value, [Value; 3]) {
         // 1-D groups only until `Lw::setup_lanes_compute` numbers 2-D / 3-D threads by arrival
-        // (`compute` refuses the others): a 1-D group's waves are its consecutive threads
+        // (`compute` refuses the others): a 1-D group's waves are its consecutive threads; in
+        // the split form, the console thread the arrival order gave this one
         debug_assert!(threads[1] * threads[2] == 1);
-        let flat = self.s.thread_id_in_group(0);
+        let flat = match self.split {
+            Some(sp) => sp.tid,
+            None => self.s.thread_id_in_group(0),
+        };
         let zero = self.s.m.i32c(0);
         (flat, [flat, zero, zero])
     }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
         let w = self.s.wave_ballot(c);
-        [w[0], w[1]]
+        let Some(sp) = self.split else { return [w[0], w[1]] };
+        // this half's word, and the other half's through an exchange
+        let other = self.exchange(w[0]);
+        let z = self.c(0);
+        let low = self.s.m.cmp(Pred::Eq, sp.half, z);
+        let lo = self.s.m.select(low, w[0], other);
+        let hi = self.s.m.select(low, other, w[0]);
+        [lo, hi]
     }
     // one hardware wave per console wave (native wave64, or wave32): the half-local forms are
-    // the same operations
+    // the same operations; split: this half's word in both places (only its own is right)
     fn ballot_half(&mut self, c: Value) -> [Value; 2] {
-        self.ballot(c)
+        let w = self.s.wave_ballot(c);
+        [w[0], if self.split.is_some() { w[0] } else { w[1] }]
     }
     fn read_lane(&mut self, v: Value, lane: Value) -> Value {
-        self.s.wave_read_lane_at(v, lane)
+        let Some(sp) = self.split else { return self.s.wave_read_lane_at(v, lane) };
+        // `lane` is the same in every lane (readlane, readfirstlane): each half reads it in its
+        // own 32 and gives that; the owner half's value is the answer
+        let l31 = self.bin2(BinOp::And, lane, 31);
+        let m = self.s.wave_read_lane_at(v, l31);
+        let o = self.exchange(m);
+        let lh = self.bin2(BinOp::LShr, lane, 5);
+        let same = self.s.m.cmp(Pred::Eq, lh, sp.half);
+        self.s.m.select(same, m, o)
     }
     fn read_lane_half(&mut self, v: Value, lane: Value) -> Value {
-        self.read_lane(v, lane)
+        if self.split.is_some() {
+            let l31 = self.bin2(BinOp::And, lane, 31);
+            return self.s.wave_read_lane_at(v, l31);
+        }
+        self.s.wave_read_lane_at(v, lane)
     }
     fn count_bits(&mut self, v: Value) -> Value {
         self.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
@@ -180,7 +313,7 @@ impl Ir for DxilIr {
 /// `WaveSize` = the program's wave size), and the masks whose final value may differ from
 /// the console's (`lower::lower_kernel`).
 pub fn kernel(insts: &[Decoded], wave64: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let (ir, stale) = lower::lower_kernel(insts, wave64, DxilIr::new(true))?;
+    let (ir, stale) = lower::lower_kernel(insts, wave64, DxilIr::new(true, None))?;
     let lanes = if wave64 { 64 } else { 32 };
     Ok((ir.s.finish([lanes, 1, 1], Some(lanes)), stale))
 }
@@ -217,10 +350,10 @@ pub fn survey_compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -
     if cs.threads[1] * cs.threads[2] > 1 {
         let flat = super::CsInterface { threads: [cs.threads.iter().product(), 1, 1], ..cs.clone() };
         let mut why = vec!["2-D / 3-D thread group (waits for Lw::setup_lanes_compute)".to_string()];
-        why.extend(lower::survey_compute(&insts, &flat, wave64, DxilIr::new(false)));
+        why.extend(lower::survey_compute(&insts, &flat, wave64, DxilIr::new(false, None)));
         return why;
     }
-    lower::survey_compute(&insts, cs, wave64, DxilIr::new(false))
+    lower::survey_compute(&insts, cs, wave64, DxilIr::new(false, None))
 }
 
 /// A compute program in its per-lane form, as a signed DXIL container.
@@ -228,8 +361,31 @@ pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Resu
     if cs.threads[1] * cs.threads[2] > 1 {
         return Err("2-D / 3-D thread group (waits for Lw::setup_lanes_compute)".into());
     }
-    let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(false))?;
+    let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(false, None))?;
     Ok(ir.s.finish(cs.threads, Some(if wave64 { 64 } else { 32 })))
+}
+
+/// `kernel` of a wave64 program for a GPU with 32-lane waves only: the split form, two
+/// hardware wave32s per console wave exchanging through group-shared memory.
+/// EXEC at launch must be full: a lane outside it goes straight to the exit and would miss the
+/// barriers the halves meet at in the program (compute waves always start with every lane).
+pub fn kernel_split(insts: &[Decoded]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (ir, stale) = lower::lower_kernel(insts, true, DxilIr::new(true, Some(64)))?;
+    Ok((ir.s.finish([64, 1, 1], Some(32)), stale))
+}
+
+/// `compute` of a wave64 program in the split form (1-D groups).
+pub fn compute_split(insts: &[Decoded], cs: &super::CsInterface) -> Result<Vec<u8>, String> {
+    if cs.threads[1] * cs.threads[2] != 1 {
+        return Err("split form: 2-D / 3-D groups stay on HLSL".into());
+    }
+    if cs.threads[0] > 64 {
+        // several console waves per group: their halves would pair up through arrival
+        // counters and a polled spin, whose loop needs blocks of its own (not yet here)
+        return Err("split form: groups of several console waves stay on HLSL".into());
+    }
+    let ir = lower::lower_compute(insts, cs, true, DxilIr::new(false, Some(cs.threads[0])))?;
+    Ok(ir.s.finish(cs.threads, Some(32)))
 }
 
 #[cfg(test)]

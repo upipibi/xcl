@@ -2052,6 +2052,89 @@ pub(crate) mod tests {
         }
     }
 
+    /// The split form (two hardware wave32s per console wave64, `lower_dxil::kernel_split`) run
+    /// on the GPU gives the registers and memory of the wave64 lowering run on the CPU: masks
+    /// across both halves, lane reads through the exchange (readfirstlane, readlane, the counts
+    /// of EXEC as numbers, mbcnt), and the reads that stay in their half (DPP, permlanex16,
+    /// ds_swizzle). A whole-wave read where lanes leave one by one is refused.
+    #[test]
+    fn the_split_form_agrees_with_the_wave64_lowering_on_the_gpu() {
+        use super::super::{lower_dxil, runner};
+        if runner::adapter().is_err() {
+            runner::skip_test("no GPU");
+            return;
+        }
+        let reads = lane_reads(true);
+        // reads across the halves both ways: readlane of lane 41 (the lower half needs the
+        // upper's), readfirstlane with EXEC from lane 40 up (the first lane is in the upper
+        // half), and a 64-bit compare mask counted as a number
+        const ACROSS: &[I] = &[
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", 169)]),
+            ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 131)]),
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 168), ("VSRC1", 0)]),
+            ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 168)]),
+            ("V_CMPX_LE_U32", "ENC_VOPC", &[("SRC0", V + 2), ("VSRC1", 0)]),
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 1)]),
+            ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 13), ("SSRC0", 126)]),
+            ENDPGM,
+        ];
+        for (name, lines) in [
+            ("across the halves", ACROSS),
+            ("straight", STRAIGHT),
+            ("skipped if", SKIPPED_IF_W64),
+            ("leaving loop", LEAVING_LOOP_W64),
+            ("uniform loop", UNIFORM_LOOP),
+            ("memory", MEMORY_W64),
+            ("lane reads", &reads[..]),
+        ] {
+            let insts = decode(lines);
+            let (dxil, stale) = lower_dxil::kernel_split(&insts).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (s, v) = state(64);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let mem = memory_image();
+            let gpu = runner::run(&dxil, &st, &mem).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (cs, cv, cmem) = run_mem(lines, true, &s, &v, &mem);
+            assert_eq!(&gpu.mem[..cmem.len()], &cmem[..], "{name}: memory");
+            let mut sregs: Vec<usize> = vec![106, 107, 126, 127];
+            let mut vregs: Vec<usize> = Vec::new();
+            for d in &insts {
+                let (r, w) = rdna2::sgpr_uses(d);
+                sregs.extend(r.iter().chain(&w).map(|&x| x as usize).filter(|&x| x < 125));
+                let (r, w) = rdna2::vgpr_uses(d);
+                vregs.extend(r.iter().chain(&w).map(|&x| x as usize));
+            }
+            for &r in sregs.iter().filter(|&&r| !stale.contains(&(r as u8))) {
+                assert_eq!(gpu.sgpr[r], cs[r], "{name}: s{r}");
+            }
+            for l in 0..64 {
+                for &r in &vregs {
+                    assert_eq!(gpu.vgpr[l][r], cv[l][r], "{name}: lane {l} v{r}");
+                }
+            }
+        }
+        // compute mode: a 64-thread group as two hardware wave32s, threads numbered by arrival
+        let cs = compute_cs();
+        let dxil = lower_dxil::compute_split(&decode(COMPUTE), &cs).unwrap();
+        let mem = vec![0u32; 256];
+        let gpu = runner::dispatch(&dxil, [3, 1, 1], &[100, 0], &mem).unwrap();
+        let cpu = run_compute(COMPUTE, &cs, 3, &[100, 0], &mem);
+        assert_eq!(&gpu[..cpu.len()], &cpu[..], "compute");
+        // several console waves per group stay on HLSL for now
+        let big = crate::gpu::recomp::CsInterface { threads: [128, 1, 1], ..compute_cs() };
+        assert!(lower_dxil::compute_split(&decode(COMPUTE), &big).is_err());
+        // the waterfall's readfirstlane is in a block lanes leave one by one: native wave64
+        // takes it, the split form cannot meet the other half there
+        let insts = decode(&waterfall(true));
+        assert!(lower_kernel(&insts, true, Interp::default()).is_ok());
+        let e = lower_dxil::kernel_split(&insts).unwrap_err();
+        assert!(e.contains("split form"), "{e}");
+    }
+
     #[test]
     fn scalar_and_vector_memory_with_a_guarded_store() {
         let (s, v) = state(32);
