@@ -50,7 +50,7 @@ impl<I: Ir> Lower<'_, I> {
     /// The mask in s<r> as numbers (lanes 0–31, 32–63): the ballot of its bits; with `half`,
     /// only this lane's half of it is right (`Ir::ballot_half`).
     fn mask_words(&mut self, b: usize, r: u8, half: bool) -> R<[I::V; 2]> {
-        if r != EXEC {
+        if r != EXEC || (!half && self.ir.whole_needs_exchange()) {
             self.all_lanes(b, "a mask read as a number")?;
         }
         let bit = self.read_bit(b, r)?;
@@ -118,6 +118,10 @@ impl<I: Ir> Lower<'_, I> {
 
     /// The lanes in EXEC, as numbers; with `half`, only this lane's half is right.
     fn exec_words(&mut self, b: usize, half: bool) -> R<[I::V; 2]> {
+        // split: the other half's word comes through an exchange, which both halves must reach
+        if !half && self.ir.whole_needs_exchange() {
+            self.all_lanes(b, "EXEC as a number in the split form")?;
+        }
         let e = self.read_bit(b, EXEC)?;
         let [lo, hi] = if half { self.ir.ballot_half(e) } else { self.ir.ballot(e) };
         Ok([lo, if self.wave64 { hi } else { self.ir.int(0) }])

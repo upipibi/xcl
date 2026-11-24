@@ -83,6 +83,11 @@ pub trait Ir: Sink {
     fn read_lane(&mut self, v: Self::V, lane: Self::V) -> Self::V;
     /// `read_lane` of a lane in this lane's 32-lane half (DPP, permlane, swizzle)
     fn read_lane_half(&mut self, v: Self::V, lane: Self::V) -> Self::V;
+    /// Whether a whole-wave `ballot` / `read_lane` meets another hardware wave (the split form
+    /// of a wave64 program): then it needs every lane of the console wave where it runs.
+    fn whole_needs_exchange(&self) -> bool {
+        false
+    }
     /// the number of bits set in `v` (`countbits`)
     fn count_bits(&mut self, v: Self::V) -> Self::V;
     fn io_load(&mut self, dword: Self::V) -> Self::V;
