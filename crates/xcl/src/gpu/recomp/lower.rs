@@ -566,6 +566,15 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.ir.select(m, c, a)
             }
             _ => {
+                // the opcode first: an unsupported VOP1 has no SRC1, which would read as s0
+                const TWO_SOURCE: &[&str] = &[
+                    "V_ADD_NC_U32", "V_ADD_U32", "V_SUB_NC_U32", "V_SUB_U32", "V_SUBREV_NC_U32", "V_SUBREV_U32", "V_AND_B32", "V_OR_B32", "V_XOR_B32",
+                    "V_MUL_LO_U32", "V_LSHL_ADD_U32", "V_ADD_LSHL_U32", "V_LSHL_OR_B32", "V_AND_OR_B32", "V_OR3_B32", "V_XOR3_B32", "V_ADD3_U32",
+                    "V_LSHLREV_B32", "V_LSHRREV_B32", "V_ASHRREV_I32",
+                ];
+                if !TWO_SOURCE.contains(&name) {
+                    return Err(format!("unsupported {name}"));
+                }
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
                 let c31 = self.ir.int(31);
                 match name {
