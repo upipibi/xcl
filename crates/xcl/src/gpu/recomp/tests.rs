@@ -7145,6 +7145,103 @@ fn gpu_split_wave64_reduction_tails() {
     assert_eq!(r.sgpr[21], 0x1111, "inactive-lane-0 s_out keeps unmodified old v7[0]");
 }
 
+/// A wave64 compute group of at most 32 threads: the console wave is launched with EXEC =
+/// the group's threads (lanes 0..31 at most), but its VGPRs still have 64 lanes, and whole-wave
+/// code (`s_or_saveexec_b64 s, -1`) writes lanes 32..63 (and, with 16 threads, 16..31). A
+/// `v_readlane` of such a lane returns what was written there, EXEC does not matter to it.
+///
+/// Program (v0 = thread id, user SGPRs s[0:1]):
+/// ```text
+///   s_or_saveexec_b64 s[2:3], -1      ; EXEC = all 64 lanes
+///   v_mov_b32 v1, -1                  ; v1 = 0xFFFFFFFF in every lane 0..63
+///   s_mov_b64 exec, s[2:3]            ; EXEC = launched threads again
+///   v_add_nc_u32 v1, 50, v0           ; live lanes: v1 = 50 + tid
+///   (a) v_readlane_b32 s9, v1, 63      ; plain cross-half read
+///   s_mov_b32 s20, 0                  ; keeps (a) from pairing with (b)
+///   (b) v_readlane_b32 s10, v1, 31 ; v_min_u32 v1, s10, v1 ; v_readlane_b32 s11, v1, 63
+///   s_or_saveexec_b64 s[4:5], -1
+///   (c) v_readlane_b32 s12, v1, 31 ; v_min_u32 v1, s12, v1 ; v_readlane_b32 s13, v1, 63
+///   s_mov_b64 exec, s[4:5]
+///   each live thread stores s9..s13 to mem[tid * 8 + 0..4]
+/// ```
+/// Console result, from the RDNA2 ISA (v_readlane ignores EXEC; a VALU op writes only the
+/// lanes EXEC enables; v_min_u32 is an unsigned min):
+/// - 32 threads: v1 = 50 + i in lanes 0..31, 0xFFFFFFFF in lanes 32..63.
+///   (a) s9 = v1[63] = 0xFFFFFFFF.
+///   (b) s10 = v1[31] = 81; v_min (EXEC = lanes 0..31) leaves 50 + i, lane 63 untouched:
+///   s11 = 0xFFFFFFFF.
+///   (c) EXEC all ones: s12 = v1[31] = 81; lane 63 = min(81, 0xFFFFFFFF) = 81: s13 = 81.
+/// - 16 threads: v1 = 50 + i in lanes 0..15, 0xFFFFFFFF in lanes 16..63.
+///   (a) s9 = 0xFFFFFFFF. (b) s10 = v1[31] = 0xFFFFFFFF, s11 = 0xFFFFFFFF.
+///   (c) s12 = 0xFFFFFFFF; lane 63 = min(0xFFFFFFFF, 0xFFFFFFFF): s13 = 0xFFFFFFFF.
+#[test]
+fn gpu_split_wave64_small_group_reads_whole_wave_writes() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 193)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 128 + 50), ("VSRC1", 0)], None),
+        // (a)
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 1), ("SRC1", 128 + 63)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128)], None),
+        // (b) reduction tail under the launched EXEC
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", 128 + 31)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 10), ("VSRC1", 1)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", 128 + 63)], None),
+        // (c) the same tail under whole-wave EXEC
+        ("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 193)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", 128 + 31)], None),
+        ("V_MIN_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 12), ("VSRC1", 1)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", 128 + 63)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)], None),
+        // store s9..s13 at mem[tid * 8 + k]
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 128 + 5), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", 9)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 21), ("SRC0", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 22), ("SRC0", 11)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 23), ("SRC0", 12)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", 13)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 20), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 21), ("SADDR", 0x7D), ("OFFSET", 4)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 22), ("SADDR", 0x7D), ("OFFSET", 8)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 23), ("SADDR", 0x7D), ("OFFSET", 12)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 24), ("SADDR", 0x7D), ("OFFSET", 16)], None),
+    ]);
+    const F: u32 = 0xFFFF_FFFF;
+    let names = ["(a) s9 = v1[63]", "(b) s10 = v1[31]", "(b) s11 = tail v1[63]", "(c) s12 = v1[31]", "(c) s13 = tail v1[63]"];
+    let mut bad = Vec::new();
+    for (threads, want) in [(32u32, [F, 81, F, 81, 81]), (16, [F, F, F, F, F])] {
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = direct_or(&p, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
+        let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xDEAD_BEEFu32; threads as usize * 8]).unwrap();
+        println!(
+            "{threads} threads, split={} (folded tails: {}, rla_uniform calls: {})",
+            opt.split_wave64,
+            t.hlsl.matches("xcl_x_meet() ? xcl_x_get(0u) : 0u;").count().saturating_sub(3),
+            t.hlsl.matches("= xcl_x_rla_uniform(").count()
+        );
+        for tid in 0..threads as usize {
+            for k in 0..5 {
+                let got = mem[tid * 8 + k];
+                if tid == 0 {
+                    println!("  {:<22} console {:#010x}, got {:#010x}{}", names[k], want[k], got, if got == want[k] { "" } else { "  MISMATCH" });
+                }
+                if got != want[k] {
+                    bad.push(format!("{threads} threads, thread {tid}: {}: want {:#x}, got {got:#x}", names[k], want[k]));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} mismatch(es):\n{}", bad.len(), bad.iter().take(20).cloned().collect::<Vec<_>>().join("\n"));
+}
+
 /// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an
 /// SDWA compare into its SDST, `s_bitset1`, `s_movreld`) or through a read the operand
 /// tables do not show (`s_movrels`, an SMEM register offset, an SDWA scalar src1): each is
