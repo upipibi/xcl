@@ -716,8 +716,9 @@ impl Lw {
         })
     }
 
-    /// 64-bit value (lo, hi) of a scalar source code.
-    pub fn code64(&mut self, code: u64, lit: Option<u32>, f64: bool) -> Option<(Value, Value)> {
+    /// 64-bit value (lo, hi) of a scalar source code. A 32-bit literal fills the high dword of
+    /// an f64 operand, is sign-extended for a signed (`i64`) operand and zero-extended otherwise.
+    pub fn code64(&mut self, code: u64, lit: Option<u32>, f64: bool, i64: bool) -> Option<(Value, Value)> {
         Some(match code {
             0..=123 | 126 => (self.sreg(code), self.sreg(code + 1)),
             125 => (self.c(0), self.c(0)),
@@ -734,7 +735,8 @@ impl Lw {
                 if f64 {
                     (self.c(0), self.c(lit?))
                 } else {
-                    (self.c(lit?), self.c(0))
+                    let lit = lit?;
+                    (self.c(lit), self.c(if i64 && lit >> 31 == 1 { u32::MAX } else { 0 }))
                 }
             }
             256..=510 => (self.vreg(code - 256), self.vreg(code - 255)),
@@ -781,7 +783,9 @@ impl Lw {
                 if o.ty.starts_with("OPR_VGPR") && d.enc.field_width(f) <= 8 {
                     return Some((self.vreg(v), self.vreg(v + 1)));
                 }
-                self.code64(v, d.literal, f64)
+                // the signed 64-bit operands: those of the *_I64 instructions and V_MAD_I64_I32's SRC2
+                let i64 = d.inst.name.ends_with("_I64") || d.inst.name == "V_MAD_I64_I32";
+                self.code64(v, d.literal, f64, i64)
             }
             None => match o.ty {
                 "OPR_VCC" => Some((self.sreg(106), self.sreg(107))),

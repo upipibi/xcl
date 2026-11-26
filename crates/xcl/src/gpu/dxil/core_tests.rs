@@ -831,3 +831,159 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// Direct translator: float min / max order -0 below +0 in either operand order (RDNA 2 ISA,
+/// V_MIN_F32 / V_MAX_F32: min(+0, -0) = min(-0, +0) = -0, max of the two = +0), with VGPR
+/// operands and with an inline-constant or literal zero on either side.
+#[test]
+fn gpu_direct_min_max_order_minus_zero_below_plus_zero() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    const V: u64 = 256;
+    const NZ: u32 = 0x8000_0000;
+    let code = prog(&[
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_MAX_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_MIN3_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 1)], None),
+        ("V_MAX3_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 1)], None),
+        ("V_MIN_F16", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_MAX_F16", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_PK_MIN_F16", "ENC_VOP3P", &[("VDST", 16), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        ("V_PK_MAX_F16", "ENC_VOP3P", &[("VDST", 17), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        ("V_MIN_F64", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 6), ("SRC1", V + 8)], None),
+        ("V_MAX_F64", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 6), ("SRC1", V + 8)], None),
+        // a constant zero on either side: +0 inline (128), -0 literal
+        ("V_MAX_F32", "ENC_VOP2", &[("VDST", 22), ("SRC0", 128), ("VSRC1", 1)], None),
+        ("V_MAX_F32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V + 1), ("SRC1", 128)], None),
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 24), ("SRC0", 255), ("VSRC1", 1)], Some(NZ)),
+        ("V_MIN_F32", "ENC_VOP3", &[("VDST", 25), ("SRC0", V + 1), ("SRC1", 255)], Some(NZ)),
+        ("V_MAX_F32", "ENC_VOP2", &[("VDST", 26), ("SRC0", 255), ("VSRC1", 1)], Some(NZ)),
+        ("V_MIN_F32", "ENC_VOP3", &[("VDST", 27), ("SRC0", V + 1), ("SRC1", 128)], None),
+    ]);
+    let k = runner::direct_kernel_full(&code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU / wave64");
+        return;
+    }
+    let cases: [(f32, f32); 6] = [(0.0, -0.0), (-0.0, 0.0), (0.0, 0.0), (-0.0, -0.0), (-1.0, 2.0), (2.0, -0.0)];
+    let zmin = |a: f32, b: f32| if a == 0.0 && b == 0.0 { if a.is_sign_negative() || b.is_sign_negative() { -0.0 } else { 0.0 } } else { a.min(b) };
+    let zmax = |a: f32, b: f32| if a == 0.0 && b == 0.0 { if a.is_sign_negative() && b.is_sign_negative() { -0.0 } else { 0.0 } } else { a.max(b) };
+    let h = |x: f32| -> u32 {
+        match x.to_bits() {
+            0x0000_0000 => 0x0000,
+            0x8000_0000 => 0x8000,
+            0xBF80_0000 => 0xBC00,
+            0x4000_0000 => 0x4000,
+            b => panic!("no f16 for {b:#X}"),
+        }
+    };
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b) = cases[l % cases.len()];
+        r[1] = a.to_bits();
+        r[2] = b.to_bits();
+        r[3] = h(a) * 0x1_0001;
+        r[4] = h(b) * 0x1_0001;
+        let (da, db) = ((a as f64).to_bits(), (b as f64).to_bits());
+        (r[6], r[7], r[8], r[9]) = (da as u32, (da >> 32) as u32, db as u32, (db >> 32) as u32);
+    }
+    let r = runner::run_with_statics(&k.dxil, &st, &[], &[], &[], &k.static_samplers).expect("GPU run");
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let (a, b) = cases[l % cases.len()];
+        let (mn, mx) = (zmin(a, b), zmax(a, b));
+        let d = |i: usize| ((v[i + 1] as u64) << 32) | v[i] as u64;
+        let checks = [
+            ("v_min_f32", v[10], mn.to_bits()),
+            ("v_max_f32", v[11], mx.to_bits()),
+            ("v_min3_f32", v[12], mn.to_bits()),
+            ("v_max3_f32", v[13], mx.to_bits()),
+            ("v_min_f16", v[14] & 0xFFFF, h(mn)),
+            ("v_max_f16", v[15] & 0xFFFF, h(mx)),
+            ("v_pk_min_f16", v[16], h(mn) * 0x1_0001),
+            ("v_pk_max_f16", v[17], h(mx) * 0x1_0001),
+            ("v_max_f32(+0, a)", v[22], zmax(0.0, a).to_bits()),
+            ("v_max_f32(a, +0)", v[23], zmax(a, 0.0).to_bits()),
+            ("v_min_f32(-0, a)", v[24], zmin(-0.0, a).to_bits()),
+            ("v_min_f32(a, -0)", v[25], zmin(a, -0.0).to_bits()),
+            ("v_max_f32(-0, a)", v[26], zmax(-0.0, a).to_bits()),
+            ("v_min_f32(a, +0)", v[27], zmin(a, 0.0).to_bits()),
+        ];
+        for (name, got, want) in checks {
+            if got != want {
+                bad.push(format!("{name} a={a:?} b={b:?}: {got:#X}, want {want:#X}"));
+            }
+        }
+        for (name, got, want) in [("v_min_f64", d(18), (mn as f64).to_bits()), ("v_max_f64", d(20), (mx as f64).to_bits())] {
+            if got != want {
+                bad.push(format!("{name} a={a:?} b={b:?}: {got:#X}, want {want:#X}"));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Direct translator: a 32-bit literal in a signed 64-bit operand is sign-extended (an unsigned
+/// or bitmask operand's is zero-extended, an f64 operand's fills the high dword): RDNA 2 ISA,
+/// literal expansion to 64 bits; LLVM selects these operand types the same way.
+#[test]
+fn gpu_direct_i64_literal_is_sign_extended() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    const V: u64 = 256;
+    const M100: u32 = -100i32 as u32;
+    let code = prog(&[
+        // v_cmp_eq_i64 s[0:1], v[0:1] (-100), literal -100 -> all lanes
+        ("V_CMP_EQ_I64", "ENC_VOP3", &[("VDST", 0), ("SRC0", V), ("SRC1", 255)], Some(M100)),
+        // v_cmpx-free control: v_cmp_eq_u64 s[2:3], v[2:3] (0x0000_0000_FFFF_FF9C), literal -> all lanes
+        ("V_CMP_EQ_U64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 2), ("SRC1", 255)], Some(M100)),
+        // v_cmp_lt_i64 s[4:5], v[0:1] (-100 + lane), literal -50: lanes 0..=49
+        ("V_CMP_LT_I64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 4), ("SRC1", 255)], Some(-50i32 as u32)),
+        // s_ashr_i64 s[6:7], -100, 4 -> -7
+        ("S_ASHR_I64", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 255), ("SSRC1", 132)], Some(M100)),
+        // s_bfe_i64 s[8:9], -100, offset 32 width 8 -> -1 (the literal's high dword)
+        ("S_BFE_I64", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 255), ("SSRC1", 10)], Some(M100)),
+        // s_flbit_i32_i64 s12, -100 -> 57 (the first bit that differs from the sign)
+        ("S_FLBIT_I32_I64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 255)], Some(M100)),
+        // v_ashrrev_i64 v[10:11], 4, -100 -> -7
+        ("V_ASHRREV_I64", "ENC_VOP3", &[("VDST", 10), ("SRC0", 132), ("SRC1", 255)], Some(M100)),
+        // v_mad_i64_i32 v[12:13], s[14:15], v6, 1, -100 -> lane - 100
+        ("V_MAD_I64_I32", "VOP3_SDST_ENC", &[("VDST", 12), ("SDST", 14), ("SRC0", V + 6), ("SRC1", 129), ("SRC2", 255)], Some(M100)),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[10] = 32 | 8 << 16;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let x = -100i64 as u64;
+        let y = (-100 + l as i64) as u64;
+        (r[0], r[1]) = (x as u32, (x >> 32) as u32);
+        (r[2], r[3]) = (M100, 0);
+        (r[4], r[5]) = (y as u32, (y >> 32) as u32);
+        r[6] = l as u32;
+    }
+    let k = runner::direct_kernel_full(&code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU / wave64");
+        return;
+    }
+    let r = runner::run_with_statics(&k.dxil, &st, &[], &[], &[], &k.static_samplers).expect("GPU run");
+    let pair = |n: i64| (n as u32, (n as u64 >> 32) as u32);
+    let mut bad = Vec::new();
+    let mut check = |name: &str, got: (u32, u32), want: (u32, u32)| {
+        if got != want {
+            bad.push(format!("{name}: {:#010X}_{:08X}, want {:#010X}_{:08X}", got.1, got.0, want.1, want.0));
+        }
+    };
+    check("v_cmp_eq_i64 v, -100", (r.sgpr[0], r.sgpr[1]), (u32::MAX, u32::MAX));
+    check("v_cmp_eq_u64 v, 0xFFFFFF9C (control)", (r.sgpr[2], r.sgpr[3]), (u32::MAX, u32::MAX));
+    check("v_cmp_lt_i64 v, -50", (r.sgpr[4], r.sgpr[5]), pair((1i64 << 50) - 1));
+    check("s_ashr_i64 -100, 4", (r.sgpr[6], r.sgpr[7]), pair(-7));
+    check("s_bfe_i64 -100, 32:8", (r.sgpr[8], r.sgpr[9]), pair(-1));
+    check("s_flbit_i32_i64 -100", (r.sgpr[12], 0), (57, 0));
+    for l in [0usize, 1, 37, 63] {
+        let v = &r.vgpr[l];
+        check(&format!("lane {l} v_ashrrev_i64 4, -100"), (v[10], v[11]), pair(-7));
+        check(&format!("lane {l} v_mad_i64_i32 lane, 1, -100"), (v[12], v[13]), pair(l as i64 - 100));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
