@@ -179,10 +179,14 @@ impl Lw {
                             self.add(t, w)
                         }
                     };
-                    let (lo, hi) = (self.c(0xFFFF_8000), self.c(0x7FFF));
-                    let t = self.imin(t, hi);
-                    let t = self.imax(t, lo);
-                    self.andc(t, 0xFFFF)
+                    // Select between the 16-bit patterns, never mask a clamped i32: NVIDIA Ampere
+                    // (616.56) drops the `& 0xFFFF` after `IMax(IMin(t, 0x7FFF), -32768)`, and the
+                    // sign-extended low half then overwrites the packed high half.
+                    let gt = self.cmpc(Pred::SGt, t, 0x7FFF);
+                    let lt = self.cmpc(Pred::SLt, t, 0xFFFF_8000);
+                    let low = self.andc(t, 0xFFFF);
+                    let r = self.selc(gt, 0x7FFF, low);
+                    self.selc(lt, 0x8000, r)
                 }
                 "v_pk_add_u16" | "v_pk_add_i16" => {
                     let t = self.add(a, b);
@@ -1577,5 +1581,113 @@ mod rcp_d_tests {
             }
         }
         assert!(bad.is_empty(), "direct DXIL rcp_d edge failures:\n{}", bad.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod i16_clamp_mask_tests {
+    use crate::gpu::dxil::kernel;
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::runner;
+
+    fn sat16(v: i32) -> u32 {
+        v.clamp(-32768, 32767) as u32 & 0xFFFF
+    }
+
+    fn pk(lo: i16, hi: i16) -> u32 {
+        (lo as u16 as u32) | (hi as u16 as u32) << 16
+    }
+
+    /// Direct DXIL `v_pk_add_i16` / `v_pk_sub_i16` with CLAMP=1 (two different source registers),
+    /// `v_cvt_pk_i16_i32` and `v_cvt_i16_f16` across the saturation edges on the GPU: a negative
+    /// saturated low half must not spill into bits [31:16]. With `IMax(IMin(t, 0x7FFF), -0x8000) & 0xFFFF`
+    /// an RTX 3070 (driver 616.56) returned e.g. 0xFFFF_FFFE for [-1, 1] - [1, 1] instead of 0x0000_FFFE.
+    #[test]
+    fn gpu_i16_clamp_negative_low_half_keeps_high_half() {
+        match runner::wave32_supported() {
+            Ok(true) => {}
+            Ok(false) => return runner::skip_test("no wave32"),
+            Err(e) => return runner::skip_test(&e),
+        }
+        const V: u64 = 256;
+        let pkf = |dst: u64| [("VDST", dst), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("CLAMP", 1)];
+        let mut code = rdna2::encode("V_PK_ADD_I16", "ENC_VOP3P", &pkf(4), None).unwrap();
+        code.extend(rdna2::encode("V_PK_SUB_I16", "ENC_VOP3P", &pkf(5), None).unwrap());
+        code.extend(rdna2::encode("V_CVT_PK_I16_I32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 2), ("SRC1", V + 3)], None).unwrap());
+        code.extend(rdna2::encode("V_CVT_I16_F16", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 8)], None).unwrap());
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let ko = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, ko).expect("direct translate");
+
+        // [a_lo, a_hi] and [b_lo, b_hi]; the remaining lanes take pseudo-random halves
+        let pairs: [[i16; 4]; 16] = [
+            [-1, 1, 1, 1],
+            [-32768, 100, 1, -7],
+            [-2, 3, -32768, 4],
+            [5, 1, 1, 1],
+            [32767, -32768, 1, -1],
+            [-32768, 32767, -1, 1],
+            [-32768, -32768, -32768, -32768],
+            [32767, 32767, 32767, 32767],
+            [-23, 0, 0, 0],
+            [-100, 200, -100, 200],
+            [0, 0, 0, 0],
+            [-16384, 16384, -16385, 16384],
+            [-1, -1, -1, -1],
+            [100, -100, 200, 50],
+            [-32767, 5, 2, 6],
+            [1, -1, -32768, 32767],
+        ];
+        let cvt_pk: [(i32, i32); 8] =
+            [(-1, 1), (-40000, 1), (40000, -40000), (-32768, 32767), (-32769, 32768), (5, 7), (i32::MIN, i32::MAX), (-23, -23)];
+        // binary16 bits and the truncated, saturated result
+        let cvt_h: [(u32, i16); 8] = [
+            (0xBC00, -1),       // -1.0
+            (0xCDC0, -23),      // -23.0
+            (0xF8E2, -32768),   // -40000.0
+            (0x78E2, 32767),    // 40000.0
+            (0xF800, -32768),   // -32768.0
+            (0xFBFF, -32768),   // -65504.0
+            (0x3C00, 1),        // 1.0
+            (0x0000, 0),        // +0.0
+        ];
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        let mut st = runner::KernelState::default();
+        let mut want = Vec::new();
+        for lane in 0..32 {
+            let p = if lane < pairs.len() {
+                pairs[lane]
+            } else {
+                let (x, y) = (rnd(), rnd());
+                [x as i16, (x >> 16) as i16, y as i16, (y >> 16) as i16]
+            };
+            let (c0, c1) = if lane < cvt_pk.len() { cvt_pk[lane] } else { (rnd() as i32 >> (lane % 16), rnd() as i32 >> (lane % 13)) };
+            let (h, hv) = cvt_h[lane % cvt_h.len()];
+            let r = &mut st.vgpr[lane];
+            (r[0], r[1], r[2], r[3], r[8]) = (pk(p[0], p[1]), pk(p[2], p[3]), c0 as u32, c1 as u32, h);
+            let (a, b) = ([p[0] as i32, p[1] as i32], [p[2] as i32, p[3] as i32]);
+            want.push([
+                sat16(a[0] + b[0]) | sat16(a[1] + b[1]) << 16,
+                sat16(a[0] - b[0]) | sat16(a[1] - b[1]) << 16,
+                sat16(c0) | sat16(c1) << 16,
+                hv as u16 as u32,
+            ]);
+        }
+        let res = runner::run(&dxil, &st, &[]).expect("GPU run");
+        let names = ["v_pk_add_i16 clamp", "v_pk_sub_i16 clamp", "v_cvt_pk_i16_i32", "v_cvt_i16_f16"];
+        let mut bad = Vec::new();
+        for (lane, w) in want.iter().enumerate() {
+            for (k, &e) in w.iter().enumerate() {
+                let got = res.vgpr[lane][4 + k];
+                if got != e {
+                    bad.push(format!("lane {lane} {}: got {got:#010X}, want {e:#010X}", names[k]));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} mismatches:\n{}", bad.len(), bad.join("\n"));
     }
 }
