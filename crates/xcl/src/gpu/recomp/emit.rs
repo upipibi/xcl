@@ -5948,11 +5948,17 @@ void st_bytes(uint a, uint4 r, uint n) {
 // code / (2^w - 1) as f16, rounded once to nearest (RDNA2's D16 of UNORM / SNORM data): the
 // binary expansion repeats the w-bit code, so p (its first 32 bits) decides the rounding, and a
 // tie cannot happen. f32tof16 of the decoded f32 rounds twice, the second time toward zero.
+// p is the code repeated: one copy at the top, then 2, 4, 8 and 16 copies (a shift of 32 or more
+// adds nothing), so no 64-bit integers are needed. w is 1..16 (d16_fmt).
 uint norm16_rep(uint y, uint w) {
     uint d = (1u << w) - 1u;
     if (y == 0u) return 0u;
     if (y >= d) return 0x3C00u;
-    uint p = (uint)(((uint64_t)y << 32) / (uint64_t)d);
+    uint p = y << (32u - w);
+    p |= p >> w;
+    p |= select(2u * w < 32u, p >> ((2u * w) & 31u), 0u);
+    p |= select(4u * w < 32u, p >> ((4u * w) & 31u), 0u);
+    p |= select(8u * w < 32u, p >> ((8u * w) & 31u), 0u);
     uint lz = 31u - firstbithigh(p);
     int e = 14 - (int)lz;
     if (e >= 1) { uint b = (p << lz) >> 20; return ((uint)(e - 1) << 10) + (b >> 1) + (b & 1u); }
@@ -6536,5 +6542,12 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    /// The memory helpers are 32-bit work (D16 rounding included): a 64-bit integer in them would
+    /// make DXC declare `Int64Ops` for every shader that reaches it.
+    #[test]
+    fn memory_helpers_use_no_64_bit_integers() {
+        assert!(!PRELUDE_MEM.contains("int64_t"), "PRELUDE_MEM uses a 64-bit integer");
     }
 }

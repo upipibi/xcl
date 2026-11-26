@@ -527,7 +527,8 @@ impl Lw {
     /// UNORM / SNORM data is `code / (2^w - 1)`, rounded once to nearest as RDNA2 does: its
     /// binary expansion repeats the w-bit code, so its first 32 bits decide the rounding (a tie
     /// cannot happen). Other channels truncate (`f16_rtz`), as RDNA2 does, whatever the host's
-    /// `legacyF32ToF16` rounds to.
+    /// `legacyF32ToF16` rounds to. The 32 bits are the code repeated and are built by doubling
+    /// (`norm16_bits` is the same in Rust), so a D16 load needs no 64-bit integers (`Int64Ops`).
     fn d16_fmt(&mut self, s: Value, sel: Value, info: Value) -> Value {
         let f = self.f(s);
         let plain = self.f16_rtz(f);
@@ -546,6 +547,11 @@ impl Lw {
         let one = self.c(1);
         let wm1 = self.sub(w, one);
         let we = self.sel(snorm, wm1, w);
+        // the divisor's width, kept to 1..16 so that no shift below is out of range for a
+        // channel the final select discards (w = 0: no such component; 32: float or integer)
+        let sixteen = self.c(16);
+        let we = self.umin(we, sixteen);
+        let we = self.umax(we, one);
         let dmax = self.bin(BinOp::Shl, one, we);
         let dmax = self.sub(dmax, one);
         // the code, back from the decoded value (within 2 ULP of exact)
@@ -559,13 +565,21 @@ impl Lw {
         let y = self.fmul(a, df);
         let y = self.un(crate::gpu::dxil::ops_core::op::ROUND_NE, y);
         let y = self.ftoui(y);
-        // first 32 bits of y / dmax
-        let y64 = self.zext64(y);
-        let k32 = self.c64(32);
-        let y64 = self.bin(BinOp::Shl, y64, k32);
-        let d64 = self.zext64(dmax);
-        let p = self.bin(BinOp::UDiv, y64, d64);
-        let p = self.trunc32(p);
+        // first 32 bits of y / dmax: one copy of the code at the top, then 2, 4, 8 and 16 copies;
+        // a shift of 32 or more adds nothing (and would be poison as an lshr)
+        let thirty_two = self.c(32);
+        let top = self.sub(thirty_two, we);
+        let mut p = self.shl(y, top);
+        let zero = self.c(0);
+        for k in [1, 2, 4, 8] {
+            let kc = self.c(k);
+            let s = self.mul(we, kc);
+            let s31 = self.andc(s, 31);
+            let r = self.lshr(p, s31);
+            let inside = self.cmpc(Pred::ULt, s, 32);
+            let r = self.sel(inside, r, zero);
+            p = self.or(p, r);
+        }
         let lz = self.lzcnt(p);
         let fourteen = self.c(14);
         let e = self.sub(fourteen, lz);
@@ -585,7 +599,6 @@ impl Lw {
         let sub = self.add(s8, r7);
         let is_normal = self.cmp(Pred::SGe, e, one);
         let h = self.sel(is_normal, normal, sub);
-        let zero = self.c(0);
         let y0 = self.cmpc(Pred::Eq, y, 0);
         let h = self.sel(y0, zero, h);
         let full = self.cmp(Pred::UGe, y, dmax);
@@ -2620,5 +2633,122 @@ impl Lw {
             }
             Ok(())
         })
+    }
+}
+
+/// `d16_fmt`'s first 32 bits of `y / (2^w - 1)` for `0 < y < 2^w - 1`, in Rust: the w-bit code
+/// at the top, doubled to 2, 4, 8 and 16 copies (HLSL `norm16_rep` builds the same).
+#[cfg(test)]
+fn norm16_bits(y: u32, w: u32) -> u32 {
+    let mut p = y << (32 - w);
+    for k in [1, 2, 4, 8] {
+        if w * k < 32 {
+            p |= p >> (w * k);
+        }
+    }
+    p
+}
+
+#[cfg(test)]
+mod d16_tests {
+    use super::norm16_bits;
+    use crate::gpu::dxil::kernel::{translate, KernelOptions};
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::emit::{buf_format_info, BUF_FORMATS};
+    use crate::gpu::recomp::{self, dxc};
+
+    /// SFI0 bit of `Int64Ops` (`shader.rs`).
+    const INT64_OPS: u64 = 0x8000;
+
+    fn sfi0(c: &[u8]) -> u64 {
+        let n = u32::from_le_bytes(c[28..32].try_into().unwrap()) as usize;
+        (0..n)
+            .find_map(|i| {
+                let off = u32::from_le_bytes(c[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
+                (&c[off..off + 4] == b"SFI0").then(|| u64::from_le_bytes(c[off + 8..off + 16].try_into().unwrap()))
+            })
+            .expect("no SFI0 part")
+    }
+
+    /// An instruction: name, encoding, fields.
+    type Inst = (&'static str, &'static str, Vec<(&'static str, u64)>);
+
+    fn prog(list: &[Inst]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (n, e, f) in list {
+            v.extend(encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}")));
+        }
+        v.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        v
+    }
+
+    /// The UNORM / SNORM rows of the format table: the formats whose D16 loads round.
+    fn norm_formats() -> Vec<u64> {
+        let v: Vec<u64> = (0..BUF_FORMATS.len()).filter(|&i| buf_format_info(i) != 0 && (buf_format_info(i) >> 3) & 7 <= 1).map(|i| i as u64).collect();
+        assert_eq!(v.len(), 20, "UNORM / SNORM formats: {v:?}");
+        v
+    }
+
+    /// Every D16 format load of UNORM / SNORM data: buffer loads (format from the V#) and
+    /// tbuffer loads of each UNORM / SNORM format.
+    fn d16_loads() -> Vec<Inst> {
+        let mubuf = |vdata| vec![("VDATA", vdata), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)];
+        let mut v = Vec::new();
+        for n in ["BUFFER_LOAD_FORMAT_D16_X", "BUFFER_LOAD_FORMAT_D16_XY", "BUFFER_LOAD_FORMAT_D16_XYZ", "BUFFER_LOAD_FORMAT_D16_XYZW", "BUFFER_LOAD_FORMAT_D16_HI_X"] {
+            v.push((n, "ENC_MUBUF", mubuf(10)));
+        }
+        for fmt in norm_formats() {
+            for n in ["TBUFFER_LOAD_FORMAT_D16_X", "TBUFFER_LOAD_FORMAT_D16_XYZW"] {
+                let mut f = mubuf(10);
+                f.push(("FORMAT", fmt));
+                v.push((n, "ENC_MTBUF", f));
+            }
+        }
+        v
+    }
+
+    /// The first 32 bits of `code / (2^w - 1)` without 64-bit integers, for every code of every
+    /// width (the divisor widths reached are 1, 2, 7..11, 15, 16): `y == 0` and `y == 2^w - 1`
+    /// take `d16_fmt`'s early outs.
+    #[test]
+    fn norm16_bits_are_the_first_32_bits_of_the_quotient() {
+        for w in 1..=16u32 {
+            let d = (1u32 << w) - 1;
+            for y in 1..d {
+                let want = (((y as u64) << 32) / d as u64) as u32;
+                assert_eq!(norm16_bits(y, w), want, "y {y:#x} w {w}");
+            }
+        }
+    }
+
+    /// A D16 format load is 32-bit work: its module must not declare `Int64Ops`, which some
+    /// drivers lack, in the direct DXIL path or in DXC's output of the HLSL path.
+    #[test]
+    fn d16_format_loads_do_not_require_int64() {
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        // the flag is read where it is set
+        let control = prog(&[("S_LSHL_B64", "ENC_SOP2", vec![("SDST", 20), ("SSRC0", 22), ("SSRC1", 24)])]);
+        assert_ne!(sfi0(&translate(&control, o).unwrap()) & INT64_OPS, 0, "S_LSHL_B64 should set Int64Ops");
+        let loads = d16_loads();
+        let mut bad = Vec::new();
+        for (n, e, f) in &loads {
+            let code = prog(&[(*n, *e, f.clone())]);
+            let flags = sfi0(&translate(&code, o).unwrap_or_else(|x| panic!("{n} {f:?}: {x}")));
+            if flags & INT64_OPS != 0 {
+                bad.push(format!("{n} {f:?}: SFI0 {flags:#x}"));
+            }
+        }
+        assert!(bad.is_empty(), "direct DXIL D16 loads require Int64Ops:\n{}", bad.join("\n"));
+
+        let code = prog(&loads);
+        let t = recomp::translate(&code, &recomp::Options::default()).expect("hlsl translate");
+        assert!(t.complete(), "hlsl unsupported: {:?}", t.unsupported);
+        assert!(t.hlsl.contains("d16_fmt("), "HLSL takes the D16 rounding path");
+        if dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).expect("dxc");
+        assert_eq!(sfi0(&dxil) & INT64_OPS, 0, "DXC output of HLSL D16 loads requires Int64Ops: SFI0 {:#x}", sfi0(&dxil));
     }
 }
