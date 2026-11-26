@@ -358,6 +358,19 @@ impl Shader {
     pub fn bit_count(&mut self, op: BitCount, v: Value) -> Value {
         let t = self.m.type_of(v);
         let i32 = self.m.i32();
+        if let (BitCount::FirstbitLo | BitCount::FirstbitHi, Some(x), true) = (op, self.m.const_u64(v), t == i32) {
+            // Fold a bit scan of a constant: NVIDIA (RTX 3070, 616.56) takes
+            // bit 0 of a product of two odd values as 0 when it meets a scan
+            // that only resolves to 1 in the driver (`and` gives 0, `or` gives
+            // the product + 1).
+            let x = x as u32;
+            let r = match (x, op) {
+                (0, _) => u32::MAX,
+                (_, BitCount::FirstbitLo) => x.trailing_zeros(),
+                _ => x.leading_zeros(),
+            };
+            return self.m.i32c(r);
+        }
         if self.is_i64(v) {
             self.require(Feature::Int64Ops);
             if matches!(op, BitCount::Countbits) {

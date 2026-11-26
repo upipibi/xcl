@@ -831,3 +831,79 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// Runs `code` through the direct translator (wave64, split where the adapter needs it)
+/// once per state; `None` without a GPU that runs wave64 programs.
+fn gpu_direct_runs(code: &[u8], states: &[crate::gpu::recomp::runner::KernelState]) -> Option<Vec<crate::gpu::recomp::runner::KernelResult>> {
+    use crate::gpu::recomp::runner;
+    let dxil = runner::direct_kernel(code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU / wave64");
+        return None;
+    }
+    Some(states.iter().map(|st| runner::run(&dxil, st, &[0; 16]).expect("GPU run")).collect())
+}
+
+/// A bit scan of a constant (`s_ff1`, `s_flbit`, `v_ffbl`, `v_ffbh` of a literal,
+/// = 1) and-ed with the square of an odd value is 1. NVIDIA (RTX 3070, 616.56)
+/// gave 0 on every lane: it takes bit 0 of a product of two odd values as 0 when
+/// the other operand only resolves to 1 in the driver, so `bit_count` folds scans
+/// of constants.
+#[test]
+fn gpu_direct_bit_scan_of_a_constant_and_an_odd_product() {
+    use crate::gpu::recomp::runner::KernelState;
+    const V: u64 = 256;
+    type I<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    let sq_s: [I; 2] = [
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 0), ("SSRC1", 129)], None),
+        ("S_MUL_I32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 4), ("SSRC1", 4)], None),
+    ];
+    let and_s: I = ("S_AND_B32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 6), ("SSRC1", 5)], None);
+    let s_cases: [(&str, I); 3] = [
+        ("s_ff1_i32_b32 2", ("S_FF1_I32_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 130)], None)),
+        ("s_ff1_i32_b64 -2", ("S_FF1_I32_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 194)], None)),
+        ("s_flbit_i32_b32 0x40000000", ("S_FLBIT_I32_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 255)], Some(0x4000_0000))),
+    ];
+    let sq_v: [I; 2] = [
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 0)], None),
+        ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 4), ("SRC1", V + 4)], None),
+    ];
+    let and_v: I = ("V_AND_B32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 6), ("VSRC1", 5)], None);
+    let v_cases: [(&str, I); 2] = [
+        ("v_ffbl_b32 2", ("V_FFBL_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 130)], None)),
+        ("v_ffbh_u32 0x40000000", ("V_FFBH_U32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 255)], Some(0x4000_0000))),
+    ];
+    let xs: Vec<u32> = (0..64u32).map(|l| l.wrapping_mul(0x9E37_79B9) ^ (l << 7)).collect();
+    let mut bad = vec![];
+    let s_states: Vec<KernelState> = xs[..8]
+        .iter()
+        .map(|&x| {
+            let mut st = KernelState::default();
+            st.sgpr[0] = x;
+            st
+        })
+        .collect();
+    for (name, scan) in s_cases {
+        let code = prog(&[sq_s[0], sq_s[1], scan, and_s]);
+        let Some(rs) = gpu_direct_runs(&code, &s_states) else { return };
+        for (x, r) in xs.iter().zip(&rs) {
+            if r.sgpr[10] != 1 {
+                bad.push(format!("{name}, s0 {x:#x}: got {:#x}, want 0x1", r.sgpr[10]));
+            }
+        }
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = xs[l];
+    }
+    for (name, scan) in v_cases {
+        let code = prog(&[sq_v[0], sq_v[1], scan, and_v]);
+        let Some(rs) = gpu_direct_runs(&code, std::slice::from_ref(&st)) else { return };
+        let wrong = (0..64).filter(|&l| rs[0].vgpr[l][10] != 1).count();
+        if wrong > 0 {
+            bad.push(format!("{name}: {wrong}/64 lanes not 1 (lane 0 {:#x})", rs[0].vgpr[0][10]));
+        }
+    }
+    assert!(bad.is_empty(), "{} wrong:\n{}", bad.len(), bad.join("\n"));
+}
