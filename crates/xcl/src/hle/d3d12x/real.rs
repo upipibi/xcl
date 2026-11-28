@@ -4646,6 +4646,35 @@ pub(super) fn pso_root_signature_exact(pso: usize) -> Option<usize> {
 static ABI_RS_SAMPLERS: Mutex<Option<HashMap<(usize, Vec<u32>), usize>>> = Mutex::new(None);
 
 /// The XCL ABI root signature with a pipeline's static samplers (the plain one without).
+
+// --- claudetools-gh's rule from xcl#505 (comment 7235929633), applied locally to test it ---
+/// Whether a pipeline may be made from, and kept as, a driver blob on disk (one another process
+/// made). Not one with static samplers on NVIDIA: built from such a blob, its static samplers lose
+/// their linear filtering.
+pub(crate) fn blob_across_processes(static_samplers: bool, vendor: Option<u32>) -> bool {
+    !(static_samplers && vendor == Some(0x10DE))
+}
+
+/// The PCI vendor of the device's adapter (cached per adapter LUID).
+pub(crate) fn adapter_vendor(device: *mut c_void) -> Option<u32> {
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&device) }?;
+    let luid = unsafe { dev.GetAdapterLuid() };
+    static VENDORS: OnceLock<Mutex<HashMap<(i32, u32), Option<u32>>>> = OnceLock::new();
+    let mut v = VENDORS.get_or_init(Default::default).lock().unwrap();
+    *v.entry((luid.HighPart, luid.LowPart)).or_insert_with(|| unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter = factory.EnumAdapterByLuid(luid).ok()?;
+        Some(adapter.GetDesc().ok()?.VendorId)
+    })
+}
+
+static STATIC_SAMPLER_RS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+pub(super) fn note_static_sampler_rs(rs: usize) {
+    STATIC_SAMPLER_RS.lock().unwrap().get_or_insert_with(HashSet::new).insert(rs);
+}
+fn has_static_samplers(rs: usize) -> bool {
+    STATIC_SAMPLER_RS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&rs))
+}
 unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
     if samplers.is_empty() {
         return abi_rs_raw(this);
@@ -4660,6 +4689,7 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
     match crate::gpu::recomp::pso::abi_root_signature_with(dev, true, samplers) {
         Ok(rs) => {
             let raw = rs.into_raw();
+            note_static_sampler_rs(raw as usize);
             map.insert(key, raw as usize);
             Some(raw)
         }
@@ -5405,7 +5435,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         ComputeBuild::IndirectChain => driver_cache::path_for_chain_root_node(
             dxil, copy.Flags.0, driver_cache::ChainRoot::IndirectCbv, samplers, copy.NodeMask),
         _ => driver_cache::path_for_root_node(dxil, copy.Flags.0, false, samplers, copy.NodeMask),
-    };
+    }.filter(|_| blob_across_processes(has_static_samplers(rs as usize), adapter_vendor(this)));
     let from_disk = cached.is_none();
     let mut loaded = None;
     if from_disk {

@@ -197,9 +197,11 @@ fn across_processes(test: &str, others: usize, load_disk: bool) {
     let _ = std::fs::remove_dir_all(&cache);
     let expected = [AT_POINT, FILTERED, FILTERED];
     assert!(!made.from_blob && made.disk_hits == 0, "process 1 builds the pipeline itself");
-    assert!(made.file, "process 1 keeps its driver blob on disk");
+    let rule = std::env::var_os("XCL_TEST_505_RULE").is_some();
+    eprintln!("rule={rule} made: file={} from_blob={} samples={:?}; loaded: from_blob={} disk_hits={} samples={:?}", made.file, made.from_blob, made.samples, loaded.from_blob, loaded.disk_hits, loaded.samples);
+    assert!(made.file != rule, "process 1 keeps its driver blob on disk (none under the #505 rule)");
     assert!(made.samples.iter().zip(expected).all(|(&a, b)| close(a, b)), "process 1 samples {:?}, expected {expected:?}", made.samples);
-    if load_disk {
+    if load_disk && !rule {
         assert!(loaded.from_blob && loaded.disk_hits == 1, "process 2 makes the pipeline from process 1's blob");
     } else {
         assert!(!loaded.from_blob && loaded.disk_hits == 0, "process 2 builds the pipeline itself");
