@@ -887,3 +887,52 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// Runs `code` through the direct translator (wave64, split where the adapter needs it)
+/// once per state; `None` without a GPU that runs wave64 programs.
+fn gpu_direct_runs(code: &[u8], states: &[crate::gpu::recomp::runner::KernelState]) -> Option<Vec<crate::gpu::recomp::runner::KernelResult>> {
+    use crate::gpu::recomp::runner;
+    let dxil = runner::direct_kernel(code, true).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU / wave64");
+        return None;
+    }
+    Some(states.iter().map(|st| runner::run(&dxil, st, &[0; 16]).expect("GPU run")).collect())
+}
+
+/// `s_lshl_b64` by a constant of a sign-extended dword (`s_ashr_i32` by 31 or
+/// `s_bfe_i64` width 32). NVIDIA (RTX 3070, 616.56) flipped the sign of
+/// `shl i64 (sext x), 31` (s0 = 1 gave 0xFFFFFFFF_80000000), so constant counts
+/// shift the two dwords.
+#[test]
+fn gpu_direct_s_lshl_b64_by_a_constant_of_a_sign_extension() {
+    use crate::gpu::recomp::runner::KernelState;
+    let ashr = ("S_ASHR_I32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 0), ("SSRC1", 159)][..], None);
+    let bfe = ("S_BFE_I64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)][..], Some(0x0020_0000));
+    let xs = [0xFFFF_FFFAu32, 1, 3, 0x8000_0000, 0x7FFF_FFFF, 0x1234_5679, 0xDEAD_BEEF, 0, 0xFFFF_FFFF];
+    let states: Vec<KernelState> = xs
+        .iter()
+        .map(|&x| {
+            let mut st = KernelState::default();
+            st.sgpr[0] = x;
+            st
+        })
+        .collect();
+    let mut bad = vec![];
+    for sh in [31u64, 0, 1, 30, 32, 33, 63] {
+        let shl = [("SDST", 2), ("SSRC0", 0), ("SSRC1", 128 + sh)];
+        for (form, ext) in [("s_ashr_i32", ashr), ("s_bfe_i64", bfe)] {
+            let code = prog(&[ext, ("S_LSHL_B64", "ENC_SOP2", &shl, None)]);
+            let Some(rs) = gpu_direct_runs(&code, &states) else { return };
+            for (&x, r) in xs.iter().zip(&rs) {
+                let got = r.sgpr[2] as u64 | (r.sgpr[3] as u64) << 32;
+                let want = (x as i32 as i64 as u64) << sh;
+                if got != want {
+                    bad.push(format!("{form}, s_lshl_b64 {sh}, s0 {x:#x}: got {got:#x}, want {want:#x}"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} wrong:\n{}", bad.len(), bad.join("\n"));
+}
