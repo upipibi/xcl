@@ -653,9 +653,32 @@ pub fn run_with_statics(
     samplers: &[TestSampler],
     statics: &[super::pso::StaticSampler],
 ) -> Result<KernelResult, String> {
+    run_with_pipeline(state, mem, textures, samplers, |dev, plain| {
+        let rs: ID3D12RootSignature = if statics.is_empty() { plain.clone() } else { super::pso::abi_root_signature_with(dev, false, statics)? };
+        let pso: ID3D12PipelineState = unsafe {
+            dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&rs),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            })
+        }
+        .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+        Ok((pso, rs))
+    })
+}
+
+/// `run_with_statics` with the pipeline and root signature `make` builds on the runner's device
+/// (given the plain ABI root signature): a test of how XCL itself makes kernel pipelines.
+pub fn run_with_pipeline(
+    state: &KernelState,
+    mem: &[u32],
+    textures: &[TestTexture],
+    samplers: &[TestSampler],
+    make: impl FnOnce(&ID3D12Device, &ID3D12RootSignature) -> Result<(ID3D12PipelineState, ID3D12RootSignature), String>,
+) -> Result<KernelResult, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
-    let rs: ID3D12RootSignature = if statics.is_empty() { gpu.rs.clone() } else { super::pso::abi_root_signature_with(&gpu.dev, false, statics)? };
+    let (pso, rs) = make(&gpu.dev, &gpu.rs)?;
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
@@ -667,13 +690,6 @@ pub fn run_with_statics(
     let mem_len = mem.len().max(64);
     unsafe {
         let dev = &gpu.dev;
-        let pso: ID3D12PipelineState = dev
-            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: transmute_copy(&rs),
-                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
-                ..Default::default()
-            })
-            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
         let io_bytes = (io.len() * 4) as u64;
         let res_bytes = (KERNEL_RES_DWORDS * 4) as u64;
         let mem_bytes = (mem_len * 4) as u64;

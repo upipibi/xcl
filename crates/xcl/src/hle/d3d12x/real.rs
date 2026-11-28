@@ -8113,6 +8113,9 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 #[allow(dead_code)] // Two-pass identities are consumed by the next stacked cache stage.
 mod two_pass_identity;
 
+#[cfg(test)]
+mod static_sampler_blob_tests;
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
